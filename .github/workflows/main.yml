@@ -1,0 +1,74 @@
+# LivePhotoUnlock — GitHub Actions 构建 release APK
+#
+# 触发：push 到 main/master、打 tag、手动 workflow_dispatch、发布 Release
+# 说明：
+#  - 用 x86_64 的 ubuntu-latest（AGP 的 aapt2 只有 x86_64 Linux 版，arm64 环境跑不了）
+#  - compileSdk 37 的官方包名是 platforms;android-37.0（不是 android-37）
+#  - 单测 DexProbeTest 依赖本机绝对路径的真实 APK，CI 上跳过，只跑 assembleRelease
+
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # 显式用真实存在的包名，避免 api-level 映射成不存在的 android-37
+          packages: 'platforms;android-37.0 build-tools;36.0.0'
+
+      - name: Prepare signing keystore
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/keystore"
+          KS="$GITHUB_WORKSPACE/keystore/wifikeyxposed.keystore"
+          if [ -n "$KEYSTORE_B64" ]; then
+            # 推荐：把固定 keystore 放 GitHub Secret（ANDROID_KEYSTORE_BASE64 = base64 编码的 keystore 文件），
+            # 保证每次构建签名一致，能覆盖升级安装
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+          else
+            # 未配置 secret 时临时生成：每次构建签名不同，仅适合测试
+            keytool -genkeypair -v -keystore "$KS" -alias tyopxn360 -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass tyopxn360 -keypass tyopxn360 -dname "CN=LivePhotoUnlock,O=TYOPXN360,C=CN"
+          fi
+          echo "SIGNING_STORE=$KS" >> "$GITHUB_ENV"
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease -PsigningStore="$SIGNING_STORE" --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: livephoto-unlock-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Attach APK to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
