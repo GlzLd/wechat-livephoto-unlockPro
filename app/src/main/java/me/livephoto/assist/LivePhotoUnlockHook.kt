@@ -1367,14 +1367,18 @@ class LivePhotoUnlockHook : XposedModule() {
     private fun isLivePhotoExtra(key: String, clazz: Class<*>?): Boolean {
         // 钱包/支付相关一律不碰（曾致支付页崩溃，这是红线）
         if (key.contains("wallet", ignoreCase = true) || key.contains("pay", ignoreCase = true)) return false
+        // 朋友圈发表链路里出现过的 key：sns_cmd_list / sns_temp_multi_pic_items / sns_gallery_thumb_location
+        // / KMulti_Pic_Item_List / key_select_multi_pic_item —— 一个都不能漏，漏了发表就断
         if (key.contains("sns", ignoreCase = true) ||
             key.contains("livephoto", ignoreCase = true) ||
-            key.contains("live_photo", ignoreCase = true)
+            key.contains("live_photo", ignoreCase = true) ||
+            key.contains("multi_pic", ignoreCase = true) ||
+            key.contains("multipic", ignoreCase = true)
         ) return true
         val n = clazz?.name ?: return false
-        return n.contains("SnsPublishLivePhotoItem") ||
-            n.contains("LivePhoto", ignoreCase = true) ||
-            n.contains("livephoto", ignoreCase = true)
+        return n.contains("plugin.sns") ||
+            n.contains("SnsPublishLivePhotoItem") ||
+            n.contains("LivePhoto", ignoreCase = true)
     }
 
     /** 主进程判定：优先框架在 onModuleLoaded 给的进程名；绝不因反射失败在子进程里误装全套 hook */
