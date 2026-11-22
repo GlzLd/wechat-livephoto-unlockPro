@@ -396,4 +396,992 @@ class LivePhotoUnlockHook : XposedModule() {
                             val args = chain.getArgs()
                             val srcPath = args[0] as? String ?: ""
                             val dstPath = args[1] as? String ?: ""
-                            
+                            val thumbPath = args.getOrNull(2) as? String ?: ""
+                            log(Log.INFO, TAG, "chat remux bypass: src=$srcPath dst=$dstPath thumb=$thumbPath")
+                            var copyOk = false
+                            if (srcPath.isNotEmpty() && dstPath.isNotEmpty()) {
+                                try {
+                                    val src = File(srcPath)
+                                    val dst = File(dstPath)
+                                    dst.parentFile?.mkdirs()
+                                    if (src.isFile && src.length() > 0L) {
+                                        src.copyTo(dst, overwrite = true)
+                                        copyOk = true
+                                        log(Log.INFO, TAG, "chat remux copy ok: ${src.length()}B -> $dstPath")
+                                    }
+                                } catch (t: Throwable) {
+                                    log(Log.ERROR, TAG, "chat remux copy failed", t)
+                                }
+                            }
+                            // 复制失败必须回退原生 remux：返回一个 ok=false 的结果对象等于把发送判死，
+                            // 原生路径连跑的机会都没有
+                            if (!copyOk) {
+                                log(Log.WARN, TAG, "chat remux copy not ok, fallback to original remux")
+                                return@intercept chain.proceed()
+                            }
+                            ensureThumbFile(srcPath, thumbPath)
+                            newRemuxResult(loader, true) ?: chain.proceed()
+                        }
+                    log(Log.INFO, TAG, "${remuxCls.name}.${m.name} (chat remux) bypass hooked")
+                }
+
+                // 2. 朋友圈 SNS 实况转码直通（签名特征：2 参 RecordConfigProvider + Continuation）
+                if (m.parameterTypes.size == 2 && m.parameterTypes[0].name == "com.tencent.mm.plugin.recordvideo.jumper.RecordConfigProvider") {
+                    hook(m)
+                        .setPriority(PRIORITY_HIGHEST)
+                        .intercept { chain ->
+                            val provider = chain.getArgs()[0]
+                            var srcPath = ""
+                            var dstPath = ""
+                            var thumbPath = ""
+                            if (provider != null) {
+                                val p = readProviderPaths(provider)
+                                srcPath = p.src
+                                dstPath = p.dst
+                                thumbPath = p.thumb
+                                if (srcPath.isNotEmpty() || dstPath.isNotEmpty()) {
+                                    log(Log.INFO, TAG, "sns remux bypass: src=$srcPath dst=$dstPath thumb=$thumbPath (fields=${p.fieldNames})")
+                                }
+                            }
+                            // 字段读不到就回退原生 remux，绝不硬返回失败结果
+                            if (srcPath.isEmpty() || dstPath.isEmpty()) {
+                                log(Log.WARN, TAG, "sns remux provider paths unreadable, fallback to original remux")
+                                return@intercept chain.proceed()
+                            }
+                            var copyOk = false
+                            try {
+                                val src = File(srcPath)
+                                val dst = File(dstPath)
+                                dst.parentFile?.mkdirs()
+                                if (src.isFile && src.length() > 0L) {
+                                    src.copyTo(dst, overwrite = true)
+                                    copyOk = true
+                                    log(Log.INFO, TAG, "sns remux copy ok: ${src.length()}B -> $dstPath")
+                                }
+                            } catch (t: Throwable) {
+                                log(Log.ERROR, TAG, "sns remux copy failed", t)
+                            }
+                            if (!copyOk) {
+                                log(Log.WARN, TAG, "sns remux copy not ok, fallback to original remux")
+                                return@intercept chain.proceed()
+                            }
+                            ensureThumbFile(srcPath, thumbPath)
+                            newRemuxResult(loader, true) ?: chain.proceed()
+                        }
+                    log(Log.INFO, TAG, "${remuxCls.name}.${m.name} (sns remux) bypass hooked")
+                }
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "remux bypass hook setup failed (non-fatal)", t)
+        }
+
+        // ----- Android 17 跨进程 Parcelable 脱敏传递（解决 system_server 反序列化 BadParcelableException） -----
+        // 策略：不再按类名硬编码（混淆后会漏），凡是「非平台包」的 Parcelable 列表/单对象一律脱敏，
+        // 接收端用微信 classloader 还原。平台包（android./java./javax./kotlin./kotlinx./androidx.）直接放行。
+        try {
+            val intentCls = android.content.Intent::class.java
+
+            // 1a. putParcelableArrayListExtra(String, ArrayList) —— 列表形态
+            val putParcList = intentCls.getMethod("putParcelableArrayListExtra", String::class.java, java.util.ArrayList::class.java)
+            hook(putParcList)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val list = chain.getArgs()[1] as? java.util.ArrayList<*>
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    if (intent != null && list != null && list.isNotEmpty() && list.any { it != null && !isPlatformParcelable(it.javaClass) }) {
+                        try {
+                            val parcel = android.os.Parcel.obtain()
+                            parcel.writeList(list)
+                            val bytes = parcel.marshall()
+                            parcel.recycle()
+                            intent.putExtra(PARCEL_BLOB_PREFIX + key, bytes)
+                            log(Log.INFO, TAG, "parcelable list sanitized for intent: key=$key count=${list.size} bytes=${bytes.size}")
+                            return@intercept intent
+                        } catch (t: Throwable) {
+                            log(Log.WARN, TAG, "parcelable list sanitization failed, fallback normal", t)
+                        }
+                    }
+                    chain.proceed()
+                }
+
+            // 1b. putExtra(String, Parcelable) —— 单对象形态
+            val putParc = intentCls.getMethod("putExtra", String::class.java, android.os.Parcelable::class.java)
+            hook(putParc)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val value = chain.getArgs()[1]
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    if (intent != null && value != null && !isPlatformParcelable(value.javaClass)) {
+                        try {
+                            val parcel = android.os.Parcel.obtain()
+                            parcel.writeParcelable(value as android.os.Parcelable, 0)
+                            val bytes = parcel.marshall()
+                            parcel.recycle()
+                            intent.putExtra(PARCEL_BLOB1_PREFIX + key, bytes)
+                            log(Log.INFO, TAG, "parcelable sanitized for intent: key=$key bytes=${bytes.size}")
+                            return@intercept intent
+                        } catch (t: Throwable) {
+                            log(Log.WARN, TAG, "parcelable sanitization failed, fallback normal", t)
+                        }
+                    }
+                    chain.proceed()
+                }
+
+            // 2a. getParcelableArrayListExtra —— 列表还原
+            val getParcList = intentCls.getMethod("getParcelableArrayListExtra", String::class.java)
+            hook(getParcList)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    val blobKey = PARCEL_BLOB_PREFIX + key
+                    if (intent != null && intent.hasExtra(blobKey)) {
+                        val bytes = intent.getByteArrayExtra(blobKey)
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            try {
+                                val parcel = android.os.Parcel.obtain()
+                                parcel.unmarshall(bytes, 0, bytes.size)
+                                parcel.setDataPosition(0)
+                                val list = java.util.ArrayList<Any?>()
+                                parcel.readList(list, loader)
+                                parcel.recycle()
+                                log(Log.INFO, TAG, "parcelable list restored from blob: key=$key count=${list.size}")
+                                return@intercept list
+                            } catch (t: Throwable) {
+                                log(Log.WARN, TAG, "parcelable restore failed from blob", t)
+                            }
+                        }
+                    }
+                    chain.proceed()
+                }
+
+            // 2b. getParcelableExtra —— 单对象还原
+            val getParc = intentCls.getMethod("getParcelableExtra", String::class.java)
+            hook(getParc)
+                .setPriority(PRIORITY_HIGHEST)
+                .intercept { chain ->
+                    val key = chain.getArgs()[0] as? String ?: ""
+                    val intent = chain.getThisObject() as? android.content.Intent
+                    val blobKey = PARCEL_BLOB1_PREFIX + key
+                    if (intent != null && intent.hasExtra(blobKey)) {
+                        val bytes = intent.getByteArrayExtra(blobKey)
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            try {
+                                val parcel = android.os.Parcel.obtain()
+                                parcel.unmarshall(bytes, 0, bytes.size)
+                                parcel.setDataPosition(0)
+                                @Suppress("DEPRECATION")
+                                val v: android.os.Parcelable? = parcel.readParcelable(loader)
+                                parcel.recycle()
+                                log(Log.INFO, TAG, "parcelable restored from blob: key=$key")
+                                return@intercept v
+                            } catch (t: Throwable) {
+                                log(Log.WARN, TAG, "parcelable restore failed from blob", t)
+                            }
+                        }
+                    }
+                    chain.proceed()
+                }
+            log(Log.INFO, TAG, "Android 17 Intent parcelable sanitizer hooked")
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "parcelable sanitizer hook setup failed", t)
+        }
+
+        // ----- MMKV.initialize / mmkvWithID 钩子（补丁版 MMKV） -----
+        try {
+            val mmkvCls = Class.forName(MMKV_CLASS, false, loader)
+            for (m in mmkvCls.methods) {
+                if (m.name == "initialize" && java.lang.reflect.Modifier.isStatic(m.modifiers)) {
+                    hook(m).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        val r = chain.proceed()
+                        // 我们自己 mmkv() 里的 initialize 调用不触发写入（防递归）
+                        if (!sInMmkvInit && !allWritesDone()) {
+                            try { attemptConfigWrites() } catch (_: Throwable) {}
+                        }
+                        r
+                    }
+                }
+            }
+            for (m in mmkvCls.methods) {
+                if (m.name == "mmkvWithID" && java.lang.reflect.Modifier.isStatic(m.modifiers)) {
+                    hook(m).setPriority(PRIORITY_HIGHEST).intercept { chain ->
+                        val r = chain.proceed()
+                        if (r != null) {
+                            val id = chain.getArgs().firstOrNull() as? String
+                            if (id != null) boundedPut(sCachedMmkv, MAX_MMKV_CACHE, id, r)
+                        }
+                        r
+                    }
+                }
+            }
+            log(Log.INFO, TAG, "MMKV initialize/mmkvWithID hooks registered")
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "MMKV hook setup failed (non-fatal)", t)
+        }
+    }
+
+    // ==================== 核心实例注入 ====================
+
+    /** 反射创建 LivePhotoCore 并写入 wp.b.b（消除 null 短路） */
+    private fun installCoreInstance(wpb: Class<*>, loader: ClassLoader): Boolean {
+        return try {
+            val core = Class.forName(CLS_CORE, false, loader)
+                .getDeclaredConstructor().newInstance()
+            val f = findCoreField(wpb) ?: return false
+            f.isAccessible = true
+            f.set(null, core)
+            true
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "installCoreInstance failed", t)
+            false
+        }
+    }
+
+    /** 静态布尔字段按类型找（wrapper 的「是否支持」开关），不依赖字段名 */
+    private fun setStaticBool(wpb: Class<*>, @Suppress("UNUSED_PARAMETER") name: String, value: Boolean): Boolean {
+        return try {
+            val f = wpb.declaredFields.firstOrNull {
+                java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == Boolean::class.javaPrimitiveType
+            } ?: return false
+            f.isAccessible = true
+            f.setBoolean(null, value)
+            true
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "setStaticBool failed", t)
+            false
+        }
+    }
+
+    // ==================== 实况识别与视频提取 ====================
+
+    /** 批量解析 MediaStore 图片路径并做运动照片检测（路径映射带 TTL，运动检测结果按 path@size 缓存） */
+    private fun detectLivePhotos(ids: List<Long>): HashMap<Long, Boolean> {
+        val out = HashMap<Long, Boolean>()
+        val app = hostApp() ?: return out
+        val idToPath = resolveImagePaths(app, ids)
+        for ((id, path) in idToPath) {
+            val len = runCatching { File(path).length() }.getOrDefault(-1L)
+            val key = "$path@$len"
+            val cached = synchronized(sLiveCache) { sLiveCache[key] }
+            out[id] = cached ?: isMotionPhotoFile(path).also { putMotion(key, it) }
+        }
+        return out
+    }
+
+    /** 运动照片检测结果缓存（key = path@size，访问序 LRU；相册反复回调 isLivePhoto 时不再重扫磁盘） */
+    private val sLiveCache = LinkedHashMap<String, Boolean>(128, 0.75f, true)
+
+    private fun putMotion(key: String, value: Boolean) {
+        synchronized(sLiveCache) {
+            while (sLiveCache.size >= LIVE_CACHE_MAX) {
+                val it = sLiveCache.entries.iterator()
+                if (!it.hasNext()) break
+                it.next()
+                it.remove()
+            }
+            sLiveCache[key] = value
+        }
+    }
+
+    /** MediaStore _id -> (path, 查询时间) 缓存，避免相册每次回调都全量查库 */
+    private val sPathCache = HashMap<Long, Pair<String, Long>>()
+
+    /** MediaStore 分块查询 _id -> _data（带 TTL 缓存，命中的 id 不再查库） */
+    private fun resolveImagePaths(app: Application, ids: List<Long>): Map<Long, String> {
+        val result = HashMap<Long, String>()
+        if (ids.isEmpty()) return result
+        val missing = ArrayList<Long>()
+        val now = System.currentTimeMillis()
+        synchronized(sPathCache) {
+            for (id in ids) {
+                val e = sPathCache[id]
+                if (e != null && now - e.second < PATH_CACHE_TTL_MS) result[id] = e.first else missing.add(id)
+            }
+        }
+        if (missing.isEmpty()) return result
+        val uri: Uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val chunk = 300
+        var i = 0
+        while (i < missing.size) {
+            val part = missing.subList(i, minOf(i + chunk, missing.size))
+            i += chunk
+            val sel = StringBuilder("_id IN (")
+            val args = arrayOfNulls<String>(part.size)
+            part.forEachIndexed { idx, id ->
+                if (idx > 0) sel.append(',')
+                sel.append('?')
+                args[idx] = id.toString()
+            }
+            sel.append(')')
+            var c: Cursor? = null
+            try {
+                c = app.contentResolver.query(uri, PROJECTION, sel.toString(), args, null)
+                while (c != null && c.moveToNext()) {
+                    val id = c.getLong(0)
+                    val path = c.getString(1)
+                    if (!path.isNullOrEmpty()) {
+                        result[id] = path
+                        synchronized(sPathCache) {
+                            if (sPathCache.size >= PATH_CACHE_MAX) sPathCache.clear()
+                            sPathCache[id] = path to now
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                log(Log.ERROR, TAG, "resolveImagePaths query failed", t)
+            } finally {
+                try { c?.close() } catch (_: Throwable) {}
+            }
+        }
+        return result
+    }
+
+    /** 运动照片检测：从文件尾部向前分块找 MP4 ftyp box，找到即停；最多回扫 TAIL_WINDOW */
+    private fun isMotionPhotoFile(path: String): Boolean {
+        return try {
+            val f = File(path)
+            if (!f.isFile || f.length() < 64L) return false
+            val len = f.length()
+            val scanFloor = maxOf(0L, len - TAIL_WINDOW)
+            RandomAccessFile(f, "r").use { raf ->
+                var end = len
+                while (end > scanFloor) {
+                    val size = minOf(SCAN_CHUNK.toLong(), end - scanFloor).toInt()
+                    // 多读 8 字节做跨块重叠，防止 ftyp box 恰好骑在分块边界上漏检
+                    val buf = ByteArray(size + 8)
+                    raf.seek(end - size)
+                    var got = 0
+                    while (got < buf.size) {
+                        val n = raf.read(buf, got, buf.size - got)
+                        if (n < 0) break
+                        got += n
+                    }
+                    if (findFtyp(buf) >= 0) return true
+                    end -= size
+                }
+                false
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "isMotionPhotoFile($path) error", t)
+            false
+        }
+    }
+
+    /**
+     * 从 mediaId 对应的图片中提取内嵌 MP4 写到 savePath，
+     * 返回微信期望的 JSON；无法完成返回 null。
+     */
+    private fun tryExtractVideo(mediaId: Long, savePath: String): String? {
+        if (savePath.isEmpty()) return null
+        val app = hostApp() ?: return null
+        val srcPath = resolveImagePaths(app, listOf(mediaId))[mediaId] ?: return null
+        return try {
+            val src = File(srcPath)
+            val data = src.readBytes()
+            val off = findFtyp(data)
+            if (off < 0) return null
+            val dst = File(savePath)
+            dst.parentFile?.mkdirs()
+            java.io.FileOutputStream(dst).use { fos ->
+                fos.write(data, off, data.size - off)
+            }
+            boundedPut(sVideoSource, MAX_VIDEO_SOURCE, dst.absolutePath, srcPath)
+            val durationMs = parseMvhdDurationMs(data, off)
+            val (w, h) = parseTkhdSize(data, off)
+            val durField = if (durationMs > 0L) ",\"videoDuration\":$durationMs" else ""
+            val sizeField = if (w > 0 && h > 0) ",\"videoWidth\":$w,\"videoHeight\":$h" else ""
+            val json =
+                "{\"errorCode\":0,\"videoPath\":\"${dst.absolutePath.replace("\\", "\\\\")}\"," +
+                    "\"videoSize\":${data.size - off}$durField$sizeField,\"coverTimeStampMs\":0}"
+            json
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "tryExtractVideo($srcPath) failed", t)
+            null
+        }
+    }
+
+    // ==================== 导出：合成动态 JPEG ====================
+
+    /** videoFilePath -> 源图片路径（提取时记录，供导出与转码阶段回查） */
+    private val sVideoSource = LinkedHashMap<String, String>()
+
+    /** RecordConfigProvider 上读出的三条路径（src/dst/thumb）与命中的字段名（用于日志） */
+    private data class ProviderPaths(val src: String, val dst: String, val thumb: String, val fieldNames: String)
+
+    /** 从 RecordConfigProvider 读 (src, dst, thumb)：先按 A/B/C 名单快路径，再退化到「声明的前三个 String 字段」 */
+    private fun readProviderPaths(provider: Any): ProviderPaths {
+        val pCls = provider.javaClass
+        // 快路径：A/B/C 字段名（已验证版本）
+        val named = arrayOf("A", "B", "C").map { name ->
+            runCatching {
+                val f = runCatching { pCls.getField(name) }.getOrElse { pCls.getDeclaredField(name) }
+                f.isAccessible = true
+                f.get(provider) as? String ?: ""
+            }.getOrDefault("")
+        }
+        if (named.all { it.isNotEmpty() }) {
+            return ProviderPaths(named[0], named[1], named[2], "A/B/C")
+        }
+        // 结构退化：本类 + 父类声明顺序的前三个 String 字段（字段名漂移也能读）
+        val fields = (pCls.declaredFields.toList() + (pCls.superclass?.declaredFields?.toList() ?: emptyList()))
+            .filter { it.type == String::class.java }
+        if (fields.size >= 3) {
+            fields.forEach { it.isAccessible = true }
+            val vals = fields.take(3).map { runCatching { it.get(provider) as? String ?: "" }.getOrDefault("") }
+            return ProviderPaths(vals[0], vals[1], vals[2], fields.take(3).joinToString("/") { f -> f.name })
+        }
+        return ProviderPaths("", "", "", "")
+    }
+
+    /** 构造 remux 结果对象（(ZI) 构造器）：优先用 dex 探测到的结果类，回退已知名单 */
+    private fun newRemuxResult(loader: ClassLoader, ok: Boolean): Any? {
+        val names = arrayOfNulls<String>(3).also {
+            it[0] = runCatching { DexProbe.findRemux(appApkPath())?.result }.getOrNull()
+            it[1] = "re0.e"; it[2] = "ad0.e"
+        }
+        for (n in names) {
+            if (n.isNullOrEmpty()) continue
+            try {
+                val ctor = Class.forName(n, false, loader).getDeclaredConstructor(
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                )
+                ctor.isAccessible = true
+                return ctor.newInstance(ok, 0)
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
+    /** 微信 APK 路径（供 DexProbe 扫描；探测失败不影响主流程） */
+    private fun appApkPath(): String = sAppContext?.applicationInfo?.sourceDir ?: ""
+
+    /** 确保转码产物的封面缩略图存在（若不存在则从源图生成/复制，满足微信 UploadManager 的存在性校验） */
+    private fun ensureThumbFile(srcVideoPath: String, thumbPath: String) {
+        if (thumbPath.isEmpty()) return
+        val dst = File(thumbPath)
+        if (dst.isFile && dst.length() > 0L) return
+        dst.parentFile?.mkdirs()
+        // 1. 从 sVideoSource 反查原始图片提取首部纯 JPEG
+        val srcImg = synchronized(sVideoSource) { sVideoSource[srcVideoPath] }
+        if (!srcImg.isNullOrEmpty()) {
+            val f = File(srcImg)
+            if (f.isFile && f.length() > 0L) {
+                try {
+                    val data = f.readBytes()
+                    val ftypOff = findFtyp(data)
+                    val jpegLen = if (ftypOff > 0) ftypOff else data.size
+                    java.io.FileOutputStream(dst).use { it.write(data, 0, jpegLen) }
+                    log(Log.INFO, TAG, "thumb generated from srcImg: ${jpegLen}B -> $thumbPath")
+                    return
+                } catch (t: Throwable) {
+                    log(Log.WARN, TAG, "ensureThumbFile failed from $srcImg", t)
+                }
+            }
+        }
+        // 2. 兜底：在源视频同目录下找任意 jpg 作为封面
+        val dir = File(srcVideoPath).parentFile
+        if (dir != null && dir.isDirectory) {
+            val jpg = dir.listFiles { _, name -> name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) }
+                ?.sortedByDescending { it.lastModified() }?.firstOrNull()
+            if (jpg != null && jpg.isFile && jpg.length() > 0L) {
+                try {
+                    jpg.copyTo(dst, overwrite = true)
+                    log(Log.INFO, TAG, "thumb copied from sibling: ${jpg.length()}B -> $thumbPath")
+                    return
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun readJpegFile(f: File): ByteArray? {
+        return try {
+            if (!f.isFile || f.length() < 4L) return null
+            val b = f.readBytes()
+            if (b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte()) b else null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun findEmbeddedVideoIn(b: ByteArray): ByteArray? {
+        val off = findFtyp(b)
+        return if (off >= 0) b.copyOfRange(off, b.size) else null
+    }
+
+    /**
+     * exportLivePhoto(json) 真实实现。
+     * json 字段：{videoPath: 独立视频路径, coverPath: 封面输出, exportPath: 合成动态JPEG输出,
+     *            coverTimeStampMs}
+     * 行为：image(JPEG) + video(MP4) 直接拼接成动态照片格式写入 exportPath；
+     *      封面写 coverPath；确保 videoPath 存在。成功返回 true。
+     */
+    private fun tryExportLivePhoto(json: String): Boolean {
+        if (json.isBlank()) return false
+        return try {
+            val obj = org.json.JSONObject(json)
+            val videoPath = obj.optString("videoPath")
+            val coverPath = obj.optString("coverPath")
+            val exportPath = obj.optString("exportPath")
+            if (exportPath.isEmpty()) {
+                log(Log.WARN, TAG, "export: no exportPath in json")
+                return false
+            }
+
+            // ---- 收集视频字节 ----
+            var videoBytes: ByteArray? = null
+            if (videoPath.isNotEmpty()) {
+                val vf = File(videoPath)
+                if (vf.isFile && vf.length() > 64L) videoBytes = vf.readBytes()
+            }
+
+            // ---- 收集图像字节 ----
+            var imageBytes: ByteArray? = null
+            imageBytes = readJpegFile(File(coverPath))
+            if (imageBytes == null && videoPath.isNotEmpty()) {
+                synchronized(sVideoSource) { imageBytes = readJpegFile(File(sVideoSource[videoPath])) }
+            }
+            if (imageBytes == null && !coverPath.isNullOrEmpty()) {
+                // 封面路径同目录找同名/任意 jpg 兜底
+                val dir = File(coverPath).parentFile
+                if (dir != null && dir.isDirectory) {
+                    val cand = dir.listFiles { _, name -> name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) }
+                        ?.sortedByDescending { it.lastModified() }?.firstOrNull()
+                    if (cand != null) imageBytes = readJpegFile(cand)
+                }
+            }
+
+            // ---- 图像里若已内嵌视频而视频缺失，可反向提取 ----
+            if (videoBytes == null && imageBytes != null) {
+                videoBytes = findEmbeddedVideoIn(imageBytes)
+            }
+            val vb = videoBytes
+            val ib = imageBytes
+            if (vb == null || ib == null) {
+                log(Log.WARN, TAG, "export: missing pieces (img=${ib?.size}, video=${vb?.size})")
+                return false
+            }
+
+            // ---- 输出 ----
+            File(exportPath).parentFile?.mkdirs()
+            java.io.FileOutputStream(File(exportPath)).use { it.write(ib + vb) }
+            if (coverPath.isNotEmpty()) {
+                val cf = File(coverPath)
+                cf.parentFile?.mkdirs()
+                if (!cf.isFile) java.io.FileOutputStream(cf).use { it.write(ib) }
+            }
+            if (videoPath.isNotEmpty() && !File(videoPath).isFile) {
+                java.io.FileOutputStream(File(videoPath)).use { it.write(vb) }
+            }
+            log(
+                Log.INFO, TAG,
+                "export ok: img=${ib.size}B video=${vb.size}B -> $exportPath"
+            )
+            true
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "tryExportLivePhoto failed", t)
+            false
+        }
+    }
+
+    /** 在视频数据里找 mvhd 解析时长毫秒（全范围扫描 + box 大小合法性校验）；失败返回 0 */
+    private fun parseMvhdDurationMs(data: ByteArray, from: Int): Long {
+        return try {
+            var i = from
+            val end = data.size - 4
+            while (i < end) {
+                if (data[i] == 'm'.code.toByte() && data[i + 1] == 'v'.code.toByte() &&
+                    data[i + 2] == 'h'.code.toByte() && data[i + 3] == 'd'.code.toByte()
+                ) {
+                    // mvhd 前面 4 字节是自身 box size（典型 100~152）
+                    val boxSize = readI32(data, i - 4)
+                    if (boxSize in 80..4096) {
+                        val p = i + 4 // version byte
+                        val dur = if (data[p].toInt() == 1) {
+                            // v1: creation(8) modification(8) timescale(4)@p+20 duration(8)@p+24
+                            val ts = readI32(data, p + 20)
+                            val du = readI64(data, p + 24)
+                            if (ts > 0) du * 1000 / ts else 0L
+                        } else {
+                            // v0: creation(4) modification(4) timescale(4)@p+12 duration(4)@p+16
+                            val ts = readI32(data, p + 12)
+                            val du = readI32(data, p + 16).toLong() and 0xFFFFFFFFL
+                            if (ts > 0) du * 1000 / ts else 0L
+                        }
+                        if (dur > 0) return dur
+                    }
+                }
+                i++
+            }
+            0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    private fun readI32(b: ByteArray, o: Int): Int =
+        ((b[o].toInt() and 0xFF) shl 24) or ((b[o + 1].toInt() and 0xFF) shl 16) or
+            ((b[o + 2].toInt() and 0xFF) shl 8) or (b[o + 3].toInt() and 0xFF)
+
+    private fun readI64(b: ByteArray, o: Int): Long {
+        var v = 0L
+        for (k in 0 until 8) v = (v shl 8) or (b[o + k].toLong() and 0xFF)
+        return v
+    }
+
+    /** 反向扫描 ftyp box 头（[size:4]['f','t','y','p']），返回起始偏移或 -1 */
+    private fun findFtyp(buf: ByteArray): Int {
+        var i = buf.size - 8
+        while (i >= 0) {
+            if (buf[i + 4] == 'f'.code.toByte() && buf[i + 5] == 't'.code.toByte() &&
+                buf[i + 6] == 'y'.code.toByte() && buf[i + 7] == 'p'.code.toByte()
+            ) {
+                val sz = readI32(buf, i)
+                if (sz >= 8 && sz < 200_000_000) return i
+            }
+            i--
+        }
+        return -1
+    }
+
+    /** 在视频数据里找 tkhd box 解析宽高（16.16 定点数→整数）；失败返回 (0,0) */
+    private fun parseTkhdSize(data: ByteArray, from: Int): Pair<Int, Int> {
+        return try {
+            var i = from
+            val end = data.size - 4
+            while (i < end) {
+                if (data[i] == 't'.code.toByte() && data[i + 1] == 'k'.code.toByte() &&
+                    data[i + 2] == 'h'.code.toByte() && data[i + 3] == 'd'.code.toByte()
+                ) {
+                    val boxSize = readI32(data, i - 4)
+                    if (boxSize in 80..4096) {
+                        val p = i + 4 // version 字节
+                        val off = if (data[p].toInt() == 1) 88 else 76
+                        val w = ((readI32(data, p + off).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
+                        val h = ((readI32(data, p + off + 4).toLong() and 0xFFFFFFFFL) ushr 16).toInt()
+                        if (w in 2..19200 && h in 2..19200) return Pair(w, h)
+                    }
+                }
+                i++
+            }
+            0 to 0
+        } catch (_: Throwable) {
+            0 to 0
+        }
+    }
+
+    // ==================== 配置写入（持久收敛：读回校验 + 多触发点） ====================
+
+    private val sWriteLock = Any()
+    /** 微信已打开的 MMKV 实例缓存（hook mmkvWithID 截获，避免补丁下直接调失败）；设上限防长期运行无限增长 */
+    private val sCachedMmkv = LinkedHashMap<String, Any>()
+
+    /** 有界写入：超限时淘汰最老一条（插入序 LinkedHashMap），防止长期运行内存膨胀 */
+    private fun <K, V> boundedPut(map: LinkedHashMap<K, V>, max: Int, key: K, value: V) {
+        synchronized(map) {
+            while (map.size >= max) {
+                val it = map.entries.iterator()
+                if (!it.hasNext()) break
+                it.next()
+                it.remove()
+            }
+            map[key] = value
+        }
+    }
+    private var sAppContext: android.content.Context? = null
+    private var sPreviewDone = false
+    private var sSendDone = false
+    private var sExptDone = false
+    private var sStage2Done = false
+    private var sAttemptCount = 0
+    private var sLastAttemptMs = 0L
+
+    private fun allWritesDone(): Boolean =
+        sPreviewDone && sSendDone && sExptDone && sStage2Done
+
+    /** 延迟重试（0/8s/20s），每次间隔至少 5s（防 onResume 触发刷爆） */
+    private fun scheduleConfigWrites() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val delays = longArrayOf(0L, 8_000L, 20_000L)
+        for (d in delays) {
+            handler.postDelayed({ runAttempt() }, d)
+        }
+    }
+
+    private fun runAttempt() {
+        val now = System.currentTimeMillis()
+        synchronized(sWriteLock) {
+            if (now - sLastAttemptMs < 5_000L) return // 防重入
+            sLastAttemptMs = now
+            sAttemptCount++
+        }
+        try {
+            attemptConfigWrites()
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "config write attempt #$sAttemptCount failed", t)
+        }
+    }
+
+    private fun attemptConfigWrites() {
+        val ctx = sAppContext ?: return
+        synchronized(sWriteLock) {
+            var dirty = false
+            val mkv = if (!sPreviewDone || !sSendDone) mmkv(MMKV_REPAIRER) else null
+
+            // ---- 批量写入所有实况相关 Repairer 配置 ----
+            for (key in ALL_REPAIRER_KEYS) {
+                // Hevc_Soft_Encode 置 0（禁用软编，走硬件硬编通道）
+                val targetVal = if (key == "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode") 0 else 1
+                if (mkv != null && mmkvGetInt(mkv, key, -1) != targetVal) {
+                    mmkvPutInt(mkv, key, targetVal); mmkvSync(mkv)
+                    dirty = true
+                    log(Log.INFO, TAG, "Repairer written: $key=$targetVal")
+                }
+            }
+            sPreviewDone = true
+            sSendDone = true
+            // ---- 云控 expt 发送开关 ----
+            if (!sExptDone) {
+                val uin = ctx.getSharedPreferences(SP_SYSTEM_CONFIG, Application.MODE_PRIVATE)
+                    .getInt(KEY_UIN, 0)
+                if (uin != 0) {
+                    val keyMkv = mmkv("${uin}_WxExptAppKeyMmkv")
+                    val idMkv = mmkv("${uin}_WxExptAppIdMmkv")
+                    if (keyMkv != null && idMkv != null) {
+                        mmkvPutInt(keyMkv, KEY_EXPT_SEND, EXPT_ID_SEND)
+                        mmkvPutString(idMkv, EXPT_ID_SEND.toString(), exptJson(EXPT_ID_SEND, KEY_EXPT_SEND))
+                        mmkvSync(keyMkv); mmkvSync(idMkv)
+                        if (mmkvGetInt(keyMkv, KEY_EXPT_SEND, 0) == EXPT_ID_SEND) {
+                            sExptDone = true; dirty = true
+                            log(Log.INFO, TAG, "expt written+verified: $KEY_EXPT_SEND")
+                        }
+                    }
+                }
+            }
+            // ---- 阶段二检测（配置就绪后执行一次）----
+            if (!sStage2Done && sPreviewDone && sExptDone) {
+                sStage2Done = true
+                handleStage2(ctx)
+            }
+            if (!allWritesDone()) {
+                log(
+                    Log.INFO, TAG,
+                    "config pending: preview=$sPreviewDone send=$sSendDone expt=$sExptDone stage2=$sStage2Done"
+                )
+            } else if (dirty) {
+                log(Log.INFO, TAG, "all config writes verified ✓")
+            }
+        }
+    }
+
+    private fun handleStage2(context: android.content.Context) {
+        val sp = context.getSharedPreferences(SP_TINKER_SHARE, Application.MODE_PRIVATE)
+        val installInfo = sp.getString(KEY_BOOTS_INSTALL, "")
+        val hasPatch = !installInfo.isNullOrEmpty()
+        nativePatchMode = hasPatch
+        log(
+            Log.INFO, TAG,
+            "stage-2 check: tinker-boots-install-info=$installInfo, nativePatchMode=$hasPatch"
+        )
+        if (!hasPatch) return
+
+        val uin = context.getSharedPreferences(SP_SYSTEM_CONFIG, Application.MODE_PRIVATE)
+            .getInt(KEY_UIN, 0)
+        if (uin == 0) return
+
+        val keyMkv = mmkv("${uin}_WxExptAppKeyMmkv") ?: return
+        val already = mmkvGetInt(keyMkv, KEY_WRITTEN_MARK, 0)
+        if (already != 0) return
+        mmkvPutInt(keyMkv, KEY_G6, EXPT_ID_G6)
+        mmkvPutInt(keyMkv, KEY_WRITTEN_MARK, 1)
+        val idMkv = mmkv("${uin}_WxExptAppIdMmkv") ?: return
+        mmkvPutString(idMkv, EXPT_ID_G6.toString(), exptJson(EXPT_ID_G6, KEY_G6))
+        mmkvSync(keyMkv)
+        mmkvSync(idMkv)
+
+        log(Log.INFO, TAG, "stage-2: G6 written (uin=$uin), applies on next WeChat restart")
+        // 不再主动杀进程：杀主进程等于人为制造一次崩溃，会诱发微信反复自拉起、增加耗电；
+        // G6 配置在下次自然重启微信时生效
+    }
+
+    // ==================== 反射 MMKV 工具 ====================
+
+    /** 正在我们的 mmkv() 里调 initialize（防止 initialize hook 里的 attemptConfigWrites 递归） */
+    @Volatile
+    private var sInMmkvInit = false
+
+    private fun mmkv(mmapId: String): Any? {
+        // 优先用微信已打开的实例缓存（hook 截获）
+        synchronized(sCachedMmkv) {
+            sCachedMmkv[mmapId]?.let { return it }
+        }
+        // 缓存没有 → 用最终 classloader 解析，先 initialize（幂等）再 mmkvWithID
+        val ctx = sAppContext ?: return null
+        return try {
+            val mmkvCls = Class.forName(MMKV_CLASS, false, ctx.classLoader)
+            if (!sInMmkvInit) {
+                sInMmkvInit = true
+                try {
+                    mmkvCls.getMethod("initialize", android.content.Context::class.java)
+                        .invoke(null, ctx)
+                } catch (ie: Throwable) {
+                    log(Log.WARN, TAG, "MMKV.initialize failed: ${ie.cause ?: ie}")
+                } finally {
+                    sInMmkvInit = false
+                }
+            }
+            mmkvCls.getMethod("mmkvWithID", String::class.java).invoke(null, mmapId)
+        } catch (t: Throwable) {
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.cause ?: t
+            log(Log.ERROR, TAG, "mmkvWithID failed: $mmapId (${cause.javaClass.simpleName}: ${cause.message})")
+            null
+        }
+    }
+
+    private fun mmkvPutInt(mkv: Any, key: String, value: Int) {
+        try {
+            mkv.javaClass.getMethod("putInt", String::class.java, Int::class.javaPrimitiveType)
+                .invoke(mkv, key, value)
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "mmkv putInt failed: $key", t)
+        }
+    }
+
+    private fun mmkvPutString(mkv: Any, key: String, value: String) {
+        try {
+            mkv.javaClass.getMethod("putString", String::class.java, String::class.java)
+                .invoke(mkv, key, value)
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "mmkv putString failed: $key", t)
+        }
+    }
+
+    private fun mmkvGetInt(mkv: Any, key: String, def: Int): Int {
+        return try {
+            mkv.javaClass.getMethod("getInt", String::class.java, Int::class.javaPrimitiveType)
+                .invoke(mkv, key, def) as? Int ?: def
+        } catch (t: Throwable) {
+            def
+        }
+    }
+
+    private fun mmkvSync(mkv: Any) {
+        try {
+            mkv.javaClass.getMethod("sync").invoke(mkv)
+        } catch (t: Throwable) {
+            log(Log.ERROR, TAG, "mmkv sync failed", t)
+        }
+    }
+
+    // ==================== 工具 ====================
+
+    private fun hostApp(): Application? {
+        return try {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null) as? Application
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** hook 参数安全转字符串 */
+    private fun argsString(args: Any?): String = when (args) {
+        is Array<*> -> args.joinToString(", ")
+        is Collection<*> -> args.joinToString(", ")
+        else -> args.toString()
+    }
+
+    /** 平台自带的 Parcelable 不需要脱敏（system_server 能正常反序列化） */
+    private fun isPlatformParcelable(clazz: Class<*>): Boolean {
+        val n = clazz.name
+        return n.startsWith("android.") || n.startsWith("java.") || n.startsWith("javax.") ||
+            n.startsWith("kotlin.") || n.startsWith("kotlinx.") || n.startsWith("androidx.")
+    }
+
+    /** 主进程判定：优先框架在 onModuleLoaded 给的进程名；绝不因反射失败在子进程里误装全套 hook */
+    private fun isMainProcess(): Boolean {
+        sProcessName?.let { return it == PKG_WECHAT }
+        // 兜底：反射 ActivityThread.currentProcessName（隐藏 API，可能被拦）
+        val fromAt = try {
+            Class.forName("android.app.ActivityThread")
+                .getDeclaredMethod("currentProcessName").invoke(null) as? String
+        } catch (_: Throwable) {
+            null
+        }
+        if (fromAt != null) return fromAt == PKG_WECHAT
+        // 全部失败：宁可当主进程装 hook（保持旧行为），但打日志方便追查
+        log(Log.WARN, TAG, "process name unavailable, assuming main process (legacy)")
+        return true
+    }
+
+    companion object {
+        private const val TAG = "LivePhotoUnlock"
+        private const val PKG_WECHAT = "com.tencent.mm"
+        private const val CLS_CORE = "com.motion.core.LivePhotoCore"
+
+        /** 实况包装类候选名（多版本混淆映射：8.0.77=wp.b / 8.0.76=qp.b / Play 8.0.72=fq.b） */
+        private val WRAPPER_CANDIDATES = arrayOf("wp.b", "qp.b", "fq.b")
+
+        private const val SP_TINKER_SHARE = "tinker_patch_share_config"
+        private const val KEY_BOOTS_INSTALL = "tinker-boots-install-info"
+
+        private const val MMKV_CLASS = "com.tencent.mmkv.MMKV"
+        private const val MMKV_REPAIRER = "Repairer"
+        private val ALL_REPAIRER_KEYS = arrayOf(
+            "RepairerConfig_Chatting_C2C_Live_Preview_V2",
+            "RepairerConfig_Chatting_C2C_Live_Send_V4",
+            "RepairerConfig_Chatting_C2C_Live_Album_Auto_Enable",
+            "RepairerConfig_Chatting_C2C_Live_Hevc_Soft_Encode",
+            "RepairerConfig_SnsSaveLivePhoto",
+            "RepairerConfig_SnsPublishLivePhoto",
+            "RepairerConfig_SnsCheckSysLivePhoto",
+            "RepairerConfig_SnsPreDownloadLivePhoto",
+            "RepairerConfig_TextStatus_Gallery_LivePhoto_Enable",
+        )
+
+        private const val SP_SYSTEM_CONFIG = "system_config_prefs"
+        private const val KEY_UIN = "default_uin"
+
+        private const val KEY_EXPT_SEND = "clicfg_chatting_c2c_live_send_v4"
+        private const val KEY_G6 = "clicfg_live_photo_extra_manufacturer"
+        private const val KEY_WRITTEN_MARK = "_g6_written"
+        private const val EXPT_ID_G6 = 99999
+        private const val EXPT_ID_SEND = 100000
+
+        private val PROJECTION = arrayOf("_id", "_data")
+
+        /** 运动照片尾部检测窗口（MP4 一般 1~3 秒，几 MB 内；配合分块早停，实际读取通常远小于此值） */
+        private const val TAIL_WINDOW = 12 * 1024 * 1024
+
+        /** 运动照片尾部扫描的分块大小（每块多读 8 字节做跨块重叠） */
+        private const val SCAN_CHUNK = 512 * 1024
+
+        /** 运动照片检测结果缓存上限（条） */
+        private const val LIVE_CACHE_MAX = 1024
+
+        /** MediaStore 路径映射缓存 TTL 与上限 */
+        private const val PATH_CACHE_TTL_MS = 60_000L
+        private const val PATH_CACHE_MAX = 8000
+
+        /** sVideoSource 上限（条） */
+        private const val MAX_VIDEO_SOURCE = 64
+
+        /** MMKV 实例缓存上限（条） */
+        private const val MAX_MMKV_CACHE = 32
+
+        private const val VAL_BASE64_ONE = "MQ=="
+
+        /** Intent 脱敏 byte[] 存储的前缀 key */
+        private const val PARCEL_BLOB_PREFIX = "__lp_blob_"
+
+        /** 单对象 Parcelable 脱敏的前缀 key */
+        private const val PARCEL_BLOB1_PREFIX = "__lp_blob1_"
+
+        private fun exptJson(exptId: Int, key: String): String =
+            "{\"ExptId\":$exptId,\"GroupId\":0,\"ExptSequence\":1,\"Priority\":1,\"NeedReport\":0," +
+                "\"StartTime\":0,\"EndTime\":0,\"ExptType\":4,\"SvrType\":1,\"ExptCheckSum\":\"\"," +
+                "\"Args\":[{\"Key\":\"$key\",\"Val\":\"$VAL_BASE64_ONE\"}]}"
+    }
+}
