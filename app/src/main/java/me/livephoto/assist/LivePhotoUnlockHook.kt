@@ -81,6 +81,7 @@ class LivePhotoUnlockHook : XposedModule() {
                             sAppContext = app.baseContext ?: app.applicationContext
                             registerAllHooks(app.classLoader)
                             scheduleConfigWrites()
+                            scheduleForkReaper()
                         } catch (t: Throwable) {
                             log(Log.ERROR, TAG, "appOnCreate failed", t)
                         }
@@ -480,8 +481,8 @@ class LivePhotoUnlockHook : XposedModule() {
         }
 
         // ----- Android 17 跨进程 Parcelable 脱敏传递（解决 system_server 反序列化 BadParcelableException） -----
-        // 策略：不再按类名硬编码（混淆后会漏），凡是「非平台包」的 Parcelable 列表/单对象一律脱敏，
-        // 接收端用微信 classloader 还原。平台包（android./java./javax./kotlin./kotlinx./androidx.）直接放行。
+        // 只对朋友圈/实况相关的 Parcelable（按 key 或类名判断，如 sns_cmd_list、SnsPublishLivePhotoItem）序列化为 byte[]，
+        // 躲过 system_server 校验后在接收端用微信 classloader 还原。微信内部热路径的 preloadProfiler/data 等一律不碰。
         try {
             val intentCls = android.content.Intent::class.java
 
@@ -493,7 +494,7 @@ class LivePhotoUnlockHook : XposedModule() {
                     val key = chain.getArgs()[0] as? String ?: ""
                     val list = chain.getArgs()[1] as? java.util.ArrayList<*>
                     val intent = chain.getThisObject() as? android.content.Intent
-                    if (intent != null && list != null && list.isNotEmpty() && list.any { it != null && !isPlatformParcelable(it.javaClass) }) {
+                    if (intent != null && list != null && list.isNotEmpty() && isLivePhotoExtra(key, list.firstOrNull()?.javaClass)) {
                         try {
                             val parcel = android.os.Parcel.obtain()
                             parcel.writeList(list)
@@ -509,7 +510,7 @@ class LivePhotoUnlockHook : XposedModule() {
                     chain.proceed()
                 }
 
-            // 1b. putExtra(String, Parcelable) —— 单对象形态
+            // 1b. putExtra(String, Parcelable) —— 单对象形态（sns_cmd_list 等朋友圈发表走这里）
             val putParc = intentCls.getMethod("putExtra", String::class.java, android.os.Parcelable::class.java)
             hook(putParc)
                 .setPriority(PRIORITY_HIGHEST)
@@ -517,7 +518,7 @@ class LivePhotoUnlockHook : XposedModule() {
                     val key = chain.getArgs()[0] as? String ?: ""
                     val value = chain.getArgs()[1]
                     val intent = chain.getThisObject() as? android.content.Intent
-                    if (intent != null && value != null && !isPlatformParcelable(value.javaClass)) {
+                    if (intent != null && value != null && isLivePhotoExtra(key, value.javaClass)) {
                         try {
                             val parcel = android.os.Parcel.obtain()
                             parcel.writeParcelable(value as android.os.Parcelable, 0)
@@ -1212,6 +1213,69 @@ class LivePhotoUnlockHook : XposedModule() {
         // G6 配置在下次自然重启微信时生效
     }
 
+    // ==================== fork 副本回收（微信自 fork 同名子进程堆积 → 内存膨胀） ====================
+
+    /** 启动 fork 副本回收器：60 秒后开始第一轮，之后每 FORK_REAPER_INTERVAL_MS 一轮 */
+    private fun scheduleForkReaper() {
+        android.os.Handler(android.os.Looper.getMainLooper())
+            .postDelayed({ reapForkChildren() }, 60_000L)
+    }
+
+    /**
+     * 回收微信自 fork 出来的同名副本（进程名仍是 com.tencent.mm、父进程是本主进程）。
+     * 规则：只动「存活超过 FORK_CHILD_MIN_AGE_SEC」的副本，且只杀超出 FORK_CHILD_MAX 的最老那批；
+     * 刚 fork 的临时子进程（崩溃转储等）与最新保留数不受影响。每杀一个都打日志。
+     */
+    private fun reapForkChildren() {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        if (!isMainPid()) {
+            handler.postDelayed({ reapForkChildren() }, FORK_REAPER_INTERVAL_MS)
+            return
+        }
+        val myPid = Process.myPid()
+        try {
+            val uptime = runCatching {
+                File("/proc/uptime").readText().trim().split(Regex("\\s+"))[0].toDouble()
+            }.getOrElse { -1.0 }
+            data class Child(val pid: Int, val ageSec: Double)
+            val children = ArrayList<Child>()
+            val procDir = File("/proc")
+            for (f in procDir.listFiles() ?: emptyArray()) {
+                if (!f.isDirectory) continue
+                val pid = f.name.toIntOrNull() ?: continue
+                if (pid == myPid) continue
+                val stat = runCatching { f.resolve("stat").readText() }.getOrNull() ?: continue
+                val lp = stat.indexOf('(')
+                val rp = stat.indexOf(')')
+                if (lp < 0 || rp < 0) continue
+                val comm = stat.substring(lp + 1, rp)
+                val rest = stat.substring(rp + 1).trim().split(Regex("\\s+"))
+                // rest[0]=state(字段3) rest[1]=ppid(字段4) rest[19]=starttime(字段22)
+                val ppid = rest.getOrNull(1)?.toIntOrNull() ?: continue
+                val starttime = rest.getOrNull(19)?.toLongOrNull() ?: continue
+                if (comm != PKG_WECHAT || ppid != myPid) continue
+                val ageSec = if (uptime > 0) uptime - starttime / 100.0 else -1.0
+                if (ageSec >= FORK_CHILD_MIN_AGE_SEC) children.add(Child(pid, ageSec))
+            }
+            val sorted = children.sortedByDescending { it.ageSec }
+            val excess = sorted.drop(FORK_CHILD_MAX)
+            for (c in excess) {
+                try {
+                    Process.killProcess(c.pid)
+                    log(Log.INFO, TAG, "fork reaper killed child pid=${c.pid} age=${c.ageSec.toInt()}s")
+                } catch (t: Throwable) {
+                    log(Log.WARN, TAG, "fork reaper kill failed pid=${c.pid}", t)
+                }
+            }
+            if (children.isNotEmpty()) {
+                log(Log.INFO, TAG, "fork reaper scan: mature=${children.size} killed=${excess.size}")
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "fork reaper scan failed", t)
+        }
+        handler.postDelayed({ reapForkChildren() }, FORK_REAPER_INTERVAL_MS)
+    }
+
     // ==================== 反射 MMKV 工具 ====================
 
     /** 正在我们的 mmkv() 里调 initialize（防止 initialize hook 里的 attemptConfigWrites 递归） */
@@ -1299,11 +1363,18 @@ class LivePhotoUnlockHook : XposedModule() {
         else -> args.toString()
     }
 
-    /** 平台自带的 Parcelable 不需要脱敏（system_server 能正常反序列化） */
-    private fun isPlatformParcelable(clazz: Class<*>): Boolean {
-        val n = clazz.name
-        return n.startsWith("android.") || n.startsWith("java.") || n.startsWith("javax.") ||
-            n.startsWith("kotlin.") || n.startsWith("kotlinx.") || n.startsWith("androidx.")
+    /** 只对朋友圈/实况相关的 Parcelable 脱敏：按 key 或类名判断，避免误伤 preloadProfiler/data 等内部热路径 */
+    private fun isLivePhotoExtra(key: String, clazz: Class<*>?): Boolean {
+        // 钱包/支付相关一律不碰（曾致支付页崩溃，这是红线）
+        if (key.contains("wallet", ignoreCase = true) || key.contains("pay", ignoreCase = true)) return false
+        if (key.contains("sns", ignoreCase = true) ||
+            key.contains("livephoto", ignoreCase = true) ||
+            key.contains("live_photo", ignoreCase = true)
+        ) return true
+        val n = clazz?.name ?: return false
+        return n.contains("SnsPublishLivePhotoItem") ||
+            n.contains("LivePhoto", ignoreCase = true) ||
+            n.contains("livephoto", ignoreCase = true)
     }
 
     /** 主进程判定：优先框架在 onModuleLoaded 给的进程名；绝不因反射失败在子进程里误装全套 hook */
@@ -1384,9 +1455,18 @@ class LivePhotoUnlockHook : XposedModule() {
         /** MMKV 实例缓存上限（条） */
         private const val MAX_MMKV_CACHE = 32
 
+        /** fork 副本回收：扫描间隔（毫秒） */
+        private const val FORK_REAPER_INTERVAL_MS = 180_000L
+
+        /** fork 副本回收：只回收存活超过该时长的副本（秒），避免误杀刚 fork 的临时子进程 */
+        private const val FORK_CHILD_MIN_AGE_SEC = 60.0
+
+        /** fork 副本回收：允许保留的最新同名副本数（超出部分按最老优先回收） */
+        private const val FORK_CHILD_MAX = 2
+
         private const val VAL_BASE64_ONE = "MQ=="
 
-        /** Intent 脱敏 byte[] 存储的前缀 key */
+        /** Intent 脱敏 byte[] 存储的前缀 key（列表） */
         private const val PARCEL_BLOB_PREFIX = "__lp_blob_"
 
         /** 单对象 Parcelable 脱敏的前缀 key */
