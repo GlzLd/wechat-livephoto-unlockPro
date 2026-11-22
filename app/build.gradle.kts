@@ -12,13 +12,14 @@ android {
         applicationId = "me.livephoto.assist"
         minSdk = 26
         targetSdk = 36
-        versionCode = 33
-        versionName = "2.11.1"
+        versionCode = 34
+        versionName = "2.12.0"
     }
 
     signingConfigs {
         create("release") {
-            storeFile = file("/mnt/TY/android/android-project/WIfikeyXposed/wifikeyxposed.keystore")
+            // 默认沿用本机绝对路径；CI/异地构建用 -PsigningStore=<keystore 路径> 覆盖
+            storeFile = file((project.findProperty("signingStore") as String?) ?: "/mnt/TY/android/android-project/WIfikeyXposed/wifikeyxposed.keystore")
             storePassword = "tyopxn360"
             keyAlias = "tyopxn360"
             keyPassword = "tyopxn360"
