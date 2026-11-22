@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.database.Cursor
 import android.net.Uri
+import android.os.Process
 import android.provider.MediaStore
 import android.util.Log
 import io.github.libxposed.api.XposedModule
@@ -54,6 +55,9 @@ class LivePhotoUnlockHook : XposedModule() {
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         sProcessName = param.processName
+        // 记录模块加载那一刻的 PID：微信后续 fork 出的子进程会原样继承这个值，
+        // 而它们自己的 Process.myPid() 已经变了——据此识别 fork 副本
+        sMainPid = Process.myPid()
     }
 
     override fun onPackageReady(param: PackageReadyParam) {
@@ -1125,6 +1129,8 @@ class LivePhotoUnlockHook : XposedModule() {
     }
 
     private fun attemptConfigWrites() {
+        // fork 副本里 MMKV 状态是被继承的半成品，写 MMKV 会 futex 死锁；只在原主进程里写
+        if (!isMainPid()) return
         val ctx = sAppContext ?: return
         synchronized(sWriteLock) {
             var dirty = false
@@ -1316,10 +1322,17 @@ class LivePhotoUnlockHook : XposedModule() {
         return true
     }
 
+    /** 是否仍是「加载模块时的那个进程」：微信 fork 出的副本进程名不变但 PID 变了，据此识别并跳过 */
+    private fun isMainPid(): Boolean = sMainPid <= 0 || Process.myPid() == sMainPid
+
     companion object {
         private const val TAG = "LivePhotoUnlock"
         private const val PKG_WECHAT = "com.tencent.mm"
         private const val CLS_CORE = "com.motion.core.LivePhotoCore"
+
+        /** 模块加载时的 PID（fork 副本会继承该值但自身 PID 已变，用于识别副本） */
+        @Volatile
+        private var sMainPid = -1
 
         /** 实况包装类候选名（多版本混淆映射：8.0.77=wp.b / 8.0.76=qp.b / Play 8.0.72=fq.b） */
         private val WRAPPER_CANDIDATES = arrayOf("wp.b", "qp.b", "fq.b")
